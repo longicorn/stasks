@@ -4,6 +4,8 @@
 
 require 'optparse'
 require 'pstore'
+require 'fileutils'
+require 'time'
 require 'pp'
 
 option = {}
@@ -17,6 +19,9 @@ parser.on("-a", "--add", "add."){
 parser.on("-u", "--update", "update."){
   option[:update] = true
 }
+parser.on("-c", "--cancel", "cancel."){
+  option[:cancel] = true
+}
 parser.on("-r", "--ready", "debug task"){
   option[:ready] = true
 }
@@ -29,8 +34,11 @@ parser.on("-f", "--finish", "finish task"){
 parser.on("-v", "--view", "view"){
   option[:view] = true
 }
-
 parser.on("-d", "--debug", "debug"){
+  option[:delete] = true
+}
+
+parser.on("-D", "--debug", "debug"){
   option[:debug] = true
 }
 
@@ -67,7 +75,9 @@ end
 
 class Stasks
   def initialize(name)
-    path = "#{name}.db"
+    top_path="~/.stasks"
+    FileUtils.mkdir_p(top_path)
+    path = "#{top_path}/#{name}.db"
     @db = PStore.new(path)
     @@db = @db
   end
@@ -76,8 +86,19 @@ class Stasks
     @@db
   end
 
-  #def find_feature
-  #end
+  def self.find(kind, id)
+    kind = kind.to_sym
+    case kind
+    when :feature
+      Feature.find(id)
+    when :task
+      Task.find(id)
+    end
+  end
+
+  def self.find_feature(id)
+    Feature.find(id)
+  end
 
   def self.find_task(id)
     Task.find(id)
@@ -90,19 +111,34 @@ class Stasks
       @id = id
     end
 
-    def self.list(kind)
+    def self.kind
+      self.to_s.split(':')[-1].downcase.to_sym
+    end
+
+    def kind
+      self.class.to_s.split(':')[-1].downcase.to_sym
+    end
+
+    def value
+      hash = {}
+      @db.transaction do
+        break unless @db.root?(:feature)
+
+        hash = @db[kind][@id]
+      end
+      hash
+    end
+
+    def self.list
       db = Stasks.db
-      kind = kind.to_sym
 
       ret = []
-
       db.transaction do
         break unless db.root?(kind)
         db[kind].each do |id, hash|
           ret << new(db, id)
         end
       end
-
       ret
     end
 
@@ -111,53 +147,83 @@ class Stasks
 
     def move
     end
+
+    def update(hash)
+      @db.transaction do
+        [:belong, :point, :text].each do |key|
+          next unless hash.has_key?(key)
+          @db[kind][@id][key] = hash[key]
+        end
+      end
+    end
+
+    def delete
+      @db.transaction do
+        case kind
+        when :feature
+          @db[:feature].delete(@id)
+        when :task
+          @db[:task]&.delete(@id)
+          @db[:wait]&.delete(@id)
+          @db[:ready]&.delete(@id)
+          @db[:doing]&.delete(@id)
+          @db[:done]&.delete(@id)
+        end
+      end
+    end
   end
 
   class Feature < Block
-    def self.list
-      super('feature')
+    def self.find(id)
+      Feature.new(Stasks.db, id)
     end
 
     def view
-      @db.transaction do
-        break unless @db.root?(:feature)
-
-        hash = @db[:feature][@id]
-        puts "#{@id}: #{hash}"
-      end
+      hash = self.value
+      puts "#{@id}: #{hash[:text]}"
     end
   end
 
   class Task < Block
-    def self.list
-      super('task')
-    end
-
     def self.find(id)
       Task.new(Stasks.db, id)
     end
 
-    def view
+    def value
+      hash = {}
       @db.transaction do
-        task = @db[:task][@id]
-        puts "#{@id}: #{task}" if @db.root?(:task)
+        break unless @db.root?(:task)
+        hash = @db[:task][@id]
       end
+      hash
     end
 
-    def move(from, to, id, hash:nil)
-      @db.transaction do
-        task = @db[:task][id]
-        raise if task.nil?
-        raise unless @db[from].include?(id)
-        raise if @db[to] and @db[to].include?(id)
+    def view
+      hash = self.value
+      feature = Feature.find(hash[:belong])
+      feature_text = feature.value&.dig(:text)
+      hash.delete(:belong)
+      point = "#{hash[:point]}P"
 
-        @db[from].delete(id)
+      puts "#{@id}:[#{feature_text}][#{point}] #{hash[:text]}"
+    end
+
+    def move(from, to, hash=nil)
+      @db.transaction do
+        task = @db[:task][@id]
+        raise if task.nil?
+        raise unless @db[from].include?(@id)
+        raise if @db[to] and @db[to].include?(@id)
+
+        @db[from].delete(@id)
         @db[to] ||= []
-        @db[to] << id
+        @db[to] << @id
+
+        hash[:belong] = hash[:belong].to_i if hash.has_key?(:belong)
 
         unless hash.nil?
           task = task.merge(hash)
-          @db[:task][id] = task
+          @db[:task][@id] = task
         end
       end
     end
@@ -184,7 +250,7 @@ class Stasks
 
     def ready!
       raise unless self.wait?
-      self.move(:wait, :ready, @id)
+      self.move(:wait, :ready)
     end
 
     def doing?
@@ -201,7 +267,7 @@ class Stasks
       # ここでFeatureのチェックを行う
       # すでに同じFeatureがdoingになっていたら順番がおかしいはず...
       raise unless self.ready?
-      self.move(:ready, :doing, @id)
+      self.move(:ready, :doing, {start_at:Time.now})
     end
 
     def done?
@@ -216,13 +282,8 @@ class Stasks
 
     def done!
       raise unless self.doing?
-      self.move(:doing, :done, @id)
+      self.move(:doing, :done, {end_at:Time.now})
     end
-  end
-
-  def hoge
-    #Feature.list(@db)
-    #Task.list(@db).map{|v|p v.wait?}
   end
 
   def add(kind, *hash)
@@ -248,21 +309,22 @@ class Stasks
 
   def view
     # 後ほどクラスの方へ移動
-    # blongも展開する
+    # belongも展開する
     def view_feature
-      puts "# feature list..."
+      puts "# features"
       feature = Feature.list
       feature.each do |feature|
-        print '-- '
+        print '- '
         feature.view
       end
     end
 
     def view_task
-      puts "# task list..."
+      # doneに関しては、1iteration以内のデータのみで良いかも
+      puts "# tasks"
       tasks = Task.list
       [:wait, :ready, :doing, :done].each do |name|
-        puts "- #{name} list..."
+        puts "- #{name}"
         method = "#{name}?".to_sym
         tasks.select(&method).each do |task|
           print '-- '
@@ -286,9 +348,6 @@ class Stasks
   end
 end
 
-path="tasks.db"
-db=PStore.new(path)
-
 stasks = Stasks.new("tasks")
 
 option.each do |key, val|
@@ -308,18 +367,34 @@ option.each do |key, val|
     raise if keys.map{|k|option.has_key?(k)}.include?(false)
     hash = keys.inject({}){|h, k|h[k] = option[k]; h}
     stasks.add(kind, hash)
-    break
-  #when :update
-  #  raise if [:id, :kind].map{|k|option.has_key?(k)}.include?(false)
-  #  kind = option[:kind].to_sym
-  #  id = option[:id].to_i
+    stasks.view
+  when :cancel
+    raise if [:id].map{|k|option.has_key?(k)}.include?(false)
+    id = option[:id].to_i
 
-  #  db.transaction do
-  #    [:point, :text].each do |key|
-  #      next unless option.has_key?(key)
-  #      db[kind][id][key] = option[key]
-  #    end
-  #  end
+    task = Stasks.find_task(id)
+    if task.ready?
+      task.move(:ready, :wait)
+    elsif task.doing?
+      task.move(:doing, :ready)
+    elsif task.done?
+      task.move(:done, :doing)
+    end
+    stasks.view
+  when :delete
+    raise if [:id].map{|k|option.has_key?(k)}.include?(false)
+    id = option[:id].to_i
+    task = Stasks.find_task(id)
+    task.delete
+    stasks.view
+  when :update
+    raise if [:id, :kind].map{|k|option.has_key?(k)}.include?(false)
+    kind = option[:kind].to_sym
+    id = option[:id].to_i
+
+    obj = Stasks.find(kind, id)
+    obj.update(option)
+    obj.view
   when :ready
     # wait -> ready
     raise if [:id].map{|k|option.has_key?(k)}.include?(false)
@@ -351,6 +426,5 @@ option.each do |key, val|
     #PostScriptとかでお絵かき?
   when :debug
     stasks.debug
-    stasks.hoge
   end
 end
